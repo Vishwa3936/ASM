@@ -1,4 +1,4 @@
-"""The six recon stages. Each stage reads its input, runs a tool, writes raw
+"""The eight recon stages. Each stage reads its input, runs a tool, writes raw
 output to disk, persists parsed rows to SQLite, and returns data for the next
 stage. Stages are deliberately independent so they are easy to test/swap.
 
@@ -12,6 +12,8 @@ Pipeline order (corrected for ASM correctness):
                  if more than one is configured)
   6. nmap_scan   nmap -Pn --min-rate 10000 -p- on ALL scannable IPs (default);
                  --nmap-ports "" switches to discovered-ports mode (hit IPs only)
+  7. feroxbuster directory fuzzing on fuzz-worthy URLs (opt-in, parallel to 4-6)
+  8. nuclei      tech-targeted CVE + misconfiguration scanning (opt-in, parallel to 4-6)
 """
 
 from __future__ import annotations
@@ -234,10 +236,11 @@ def stage_http_probe(ctx: Context, hosts: List[str]) -> Set[str]:
 
     infile = utils.write_lines(ctx.raw("httpx_input.txt"), hosts)
     outfile = ctx.raw("httpx.jsonl")
-    ctx.runner.run(
-        [binary, "-l", str(infile), *config.HTTPX_FLAGS, "-o", str(outfile)],
-        timeout=config.TIMEOUTS["httpx"],
-    )
+    httpx_cmd = [binary, "-l", str(infile), *config.HTTPX_FLAGS,
+                  "-t", str(ctx.settings.httpx_threads),
+                  "-rl", str(ctx.settings.httpx_rate_limit),
+                  "-o", str(outfile)]
+    ctx.runner.run(httpx_cmd, timeout=config.TIMEOUTS["httpx"])
 
     stored = 0
     reached: Set[str] = set()
@@ -1071,27 +1074,17 @@ def _ferox_filename(url: str) -> str:
     return f"{host}_{port}.json"
 
 
-def _fuzz_targets_on_scannable_ips(
-    fuzz_file: Path, resolved: Dict[str, List[str]], scannable_set: Set[str],
-) -> List[str]:
-    """Read 03_fuzz_targets.txt and keep only URLs whose resolved IP is scannable."""
-    if not fuzz_file.exists():
-        return []
-    urls: List[str] = []
-    for line in fuzz_file.read_text(encoding="utf-8").splitlines():
-        url = line.strip()
-        if not url:
-            continue
-        host = (urlparse(url).hostname or "").lower().rstrip(".")
-        ips = resolved.get(host, [])
-        if any(ip in scannable_set for ip in ips):
-            urls.append(url)
-    return urls
+def stage_feroxbuster(ctx: Context) -> None:
+    """Stage 7: directory fuzzing with feroxbuster on fuzz-worthy URLs.
 
+    Reads 03_fuzz_targets.txt (URLs with 200/401/403 from Stage 3) and fuzzes
+    ALL of them — including those behind CDN edges. CDN filtering only applies
+    to port scanning (the CDN's ports ≠ the origin's), but directory fuzzing is
+    HTTP-level: the request goes through the CDN to the real application, so
+    CDN-hosted URLs are valid fuzz targets.
 
-def stage_feroxbuster(ctx: Context, resolved: Dict[str, List[str]],
-                      scannable_ips: List[str]) -> None:
-    """Stage 7: directory fuzzing with feroxbuster on scannable fuzz targets."""
+    No dependency on Stages 4-6. Can run in parallel with them.
+    """
     if not ctx.settings.run_feroxbuster:
         return
 
@@ -1107,10 +1100,12 @@ def stage_feroxbuster(ctx: Context, resolved: Dict[str, List[str]],
         return
 
     fuzz_file = ctx.workdir / "stages" / "03_fuzz_targets.txt"
-    scannable_set = set(scannable_ips)
-    targets = _fuzz_targets_on_scannable_ips(fuzz_file, resolved, scannable_set)
-    _log_input("stage7/feroxbuster", "fuzz targets (scannable IPs only)",
-               targets, "stage3/fuzz_targets + stage4/cdn_filter")
+    if not fuzz_file.exists():
+        log.info("Stage 7: 03_fuzz_targets.txt not found — skipping feroxbuster")
+        return
+    targets = [line.strip() for line in
+               fuzz_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    _log_input("stage7/feroxbuster", "fuzz targets", targets, "stage3/fuzz_targets")
 
     if not targets:
         log.info("Stage 7: no fuzz targets on scannable IPs — skipping feroxbuster")
@@ -1212,3 +1207,212 @@ def stage_feroxbuster(ctx: Context, resolved: Dict[str, List[str]],
     log.info("Stage 7 complete: fuzzed %d URL(s), discovered %d path(s) "
              "(%d with status 200 → stages/07_fuzz_200_urls.txt)",
              total, len(all_results), len(ok_urls))
+
+
+# ---------------------------------------------------------------------------
+# Stage 8 — Nuclei CVE + misconfiguration scanning (opt-in via --nuclei).
+#
+# Tech-targeted vulnerability detection using httpx fingerprints from Stage 3.
+# Reads 03_tech.json to map each host's detected technologies to nuclei
+# template tags, then runs nuclei per-host with only the relevant CVE and
+# misconfiguration templates. Conservative: no DoS/fuzz/intrusive, rate-
+# limited, medium+ severity. Runs parallel to Stages 4-6.
+# ---------------------------------------------------------------------------
+
+def _tech_to_nuclei_tags(tech_list: List[str]) -> List[str]:
+    """Map httpx technology names to nuclei template tags."""
+    tags: List[str] = []
+    for tech in tech_list:
+        key = tech.strip().lower()
+        if key in config.NUCLEI_TECH_TAG_MAP:
+            mapped = config.NUCLEI_TECH_TAG_MAP[key]
+            if mapped:
+                tags.append(mapped)
+        else:
+            tag = key.replace(" ", "-")
+            if tag:
+                tags.append(tag)
+    return sorted(set(tags))
+
+
+def _nuclei_filename(host: str) -> str:
+    """Derive a safe filename from a hostname for raw nuclei output."""
+    return f"{host.replace(':', '_').replace('/', '_')}.jsonl"
+
+
+def _parse_nuclei_jsonl(path: Path, host: str) -> List[Dict[str, Any]]:
+    """Parse nuclei JSONL output into a list of finding dicts."""
+    if not path.exists():
+        return []
+    results: List[Dict[str, Any]] = []
+    for line in path.read_text(errors="ignore", encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        info = rec.get("info", {})
+        ref = info.get("reference") or []
+        tag_list = info.get("tags") or []
+        results.append({
+            "host": host,
+            "url": rec.get("matched-at") or rec.get("host") or "",
+            "template_id": rec.get("template-id") or rec.get("templateID") or "",
+            "template_name": info.get("name") or "",
+            "severity": info.get("severity") or "",
+            "matched_at": rec.get("matched-at") or "",
+            "extracted": str(rec.get("extracted-results") or
+                            rec.get("matcher-name") or ""),
+            "curl_command": rec.get("curl-command") or "",
+            "description": info.get("description") or "",
+            "reference": ", ".join(ref) if isinstance(ref, list) else str(ref),
+            "tags": ", ".join(tag_list) if isinstance(tag_list, list) else str(tag_list),
+        })
+    return results
+
+
+def stage_nuclei(ctx: Context) -> None:
+    """Stage 8: Nuclei CVE + misconfiguration scanning with tech-targeted
+    templates derived from httpx fingerprints (03_tech.json)."""
+    if not ctx.settings.run_nuclei:
+        return
+
+    nuclei_bin = ctx.runner.resolve_binary(config.TOOL_BINARIES["nuclei"])
+    if not nuclei_bin:
+        log.warning("nuclei not found on PATH — skipping CVE scanning")
+        return
+
+    tech_file = ctx.workdir / "stages" / "03_tech.json"
+    if not tech_file.exists():
+        log.info("Stage 8: 03_tech.json not found — skipping nuclei")
+        return
+
+    try:
+        tech_data = json.loads(tech_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        log.warning("Stage 8: could not read 03_tech.json: %s", exc)
+        return
+
+    alive_file = ctx.workdir / "stages" / "03_alive_urls.txt"
+    alive_urls: Dict[str, str] = {}
+    if alive_file.exists():
+        for line in alive_file.read_text(encoding="utf-8").splitlines():
+            url = line.strip()
+            if url:
+                parsed = urlparse(url)
+                if parsed.hostname:
+                    alive_urls[parsed.hostname] = url
+
+    scan_targets: List[Dict[str, Any]] = []
+    for entry in tech_data.get("by_host", []):
+        host = entry.get("subdomain") or ""
+        url = entry.get("url") or alive_urls.get(host, "")
+        tech_list = entry.get("tech", [])
+        if not url:
+            continue
+        tags = _tech_to_nuclei_tags(tech_list)
+        if ctx.settings.nuclei_extra_tags:
+            extra = [t.strip() for t in ctx.settings.nuclei_extra_tags.split(",")
+                     if t.strip()]
+            tags = sorted(set(tags + extra))
+        if not tags:
+            log.debug("Stage 8: %s has no usable tech tags — skipping", host)
+            continue
+        scan_targets.append({"host": host, "url": url, "tags": tags})
+
+    _log_input("stage8/nuclei", "tech-fingerprinted hosts",
+               scan_targets, "stage3/tech")
+
+    if not scan_targets:
+        log.info("Stage 8: no hosts with usable tech tags — skipping nuclei")
+        return
+
+    log.info("Stage 8: scanning %d host(s) with nuclei (rate-limit=%d req/s, "
+             "concurrency=%d, severity=%s, timeout=%s, %d concurrent hosts)",
+             len(scan_targets), ctx.settings.nuclei_rate_limit,
+             ctx.settings.nuclei_concurrency, ctx.settings.nuclei_severity,
+             ctx.settings.nuclei_timeout, ctx.settings.threads_nuclei)
+
+    all_results: List[Dict[str, Any]] = []
+
+    def scan_one(target: Dict[str, Any]) -> List[Dict[str, Any]]:
+        url = target["url"]
+        tags = target["tags"]
+        host = target["host"]
+        out_path = ctx.raw("nuclei", _nuclei_filename(host))
+
+        cmd = [nuclei_bin, "-u", url,
+               "-tags", ",".join(tags)]
+        for tdir in config.NUCLEI_TEMPLATE_DIRS:
+            cmd.extend(["-t", tdir])
+        cmd.extend([
+            "-s", ctx.settings.nuclei_severity,
+            "-etags", config.NUCLEI_EXCLUDE_TAGS,
+            "-rl", str(ctx.settings.nuclei_rate_limit),
+            "-c", str(ctx.settings.nuclei_concurrency),
+            "-timeout", str(ctx.settings.nuclei_timeout),
+            "-jsonl", "-o", str(out_path),
+            "-silent", "-no-interactivity",
+        ])
+
+        log.debug("Stage 8: nuclei %s — tags: %s", host, ",".join(tags))
+        ctx.runner.run(cmd, timeout=config.TIMEOUTS["nuclei"])
+        return _parse_nuclei_jsonl(out_path, host)
+
+    total = len(scan_targets)
+    with ThreadPoolExecutor(max_workers=ctx.settings.threads_nuclei) as pool:
+        futures = {pool.submit(scan_one, t): t for t in scan_targets}
+        for done, fut in enumerate(as_completed(futures), 1):
+            target = futures[fut]
+            try:
+                results = fut.result()
+            except Exception as exc:
+                log.warning("nuclei failed for %s: %s", target["host"], exc)
+                results = []
+            all_results.extend(results)
+            for r in results:
+                ctx.storage.add_nuclei_finding(
+                    ctx.run_id, r["host"], r["url"], r["template_id"],
+                    r["template_name"], r["severity"], r["matched_at"],
+                    r["extracted"], r["curl_command"], r["description"],
+                    r["reference"], r["tags"],
+                )
+            log.debug("Stage 8 progress: %d/%d scanned (%d left) — %s (%d findings)",
+                      done, total, total - done, target["host"], len(results))
+    ctx.storage.commit()
+
+    sev_counts: Dict[str, int] = {}
+    for r in all_results:
+        s = r.get("severity", "unknown")
+        sev_counts[s] = sev_counts.get(s, 0) + 1
+
+    critical_high = [r for r in all_results
+                     if r.get("severity") in ("critical", "high")]
+    triage_lines = [
+        f"[{r['severity'].upper()}] {r['template_id']} — {r['host']} — "
+        f"{r['matched_at']}"
+        for r in critical_high
+    ]
+    utils.write_lines(ctx.stage_file("08_nuclei_critical.txt"), triage_lines)
+
+    utils.dump_json(ctx.stage_file("08_nuclei.json"), {
+        "hosts_scanned": total,
+        "findings_total": len(all_results),
+        "severity_breakdown": sev_counts,
+        "settings": {
+            "rate_limit": ctx.settings.nuclei_rate_limit,
+            "concurrency": ctx.settings.nuclei_concurrency,
+            "severity": ctx.settings.nuclei_severity,
+            "timeout": ctx.settings.nuclei_timeout,
+            "template_dirs": config.NUCLEI_TEMPLATE_DIRS,
+            "exclude_tags": config.NUCLEI_EXCLUDE_TAGS,
+        },
+        "results": all_results,
+    })
+    log.info("Stage 8 complete: scanned %d host(s), %d finding(s) (%s) — "
+             "%d critical/high → stages/08_nuclei_critical.txt",
+             total, len(all_results),
+             ", ".join(f"{k}={v}" for k, v in sorted(sev_counts.items())),
+             len(critical_high))

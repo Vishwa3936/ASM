@@ -1,15 +1,19 @@
-"""Pipeline orchestrator: wires the six stages together, manages the run
+"""Pipeline orchestrator: wires the eight stages together, manages the run
 directory, and writes the final report (JSON + Markdown).
 
 Data flow between stages is in-memory (single process), but every stage also
 persists to SQLite + stage JSON, so a crashed run leaves a queryable partial
 result and raw tool output on disk.
+
+Stages 7 (feroxbuster) and 8 (nuclei) run in background threads parallel to
+Stages 4-6: they only need Stage 3 output, not port scan or nmap results.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -42,6 +46,8 @@ class Pipeline:
             runner=self.runner, storage=self.storage, settings=self.settings,
         )
         status = "completed"
+        ferox_thread: Optional[threading.Thread] = None
+        nuclei_thread: Optional[threading.Thread] = None
         try:
             # 1. Enumerate candidate subdomains (passive sources — not yet proven live).
             subs = stages.stage_subdomains(ctx)
@@ -58,6 +64,32 @@ class Pipeline:
             #    zero-FN cross-check (reachable hosts can only be force-KEPT).
             reached_hosts = stages.stage_http_probe(ctx, sorted(resolved.keys()))
 
+            # 7. Directory fuzzing (optional, --fuzz). Starts HERE — right after
+            #    Stage 3 writes 03_fuzz_targets.txt. No dependency on Stages 4-6:
+            #    directory fuzzing is HTTP-level (goes through CDNs to the real app),
+            #    so CDN filtering only matters for port scanning, not fuzzing. Runs
+            #    in a background thread parallel to Stages 4-6.
+            if self.settings.run_feroxbuster:
+                ferox_thread = threading.Thread(
+                    target=self._run_feroxbuster, args=(ctx,),
+                    name="feroxbuster", daemon=True,
+                )
+                ferox_thread.start()
+                log.info("Stage 7 (feroxbuster) launched in background — "
+                         "running parallel to Stages 4-6")
+
+            # 8. Nuclei CVE + misconfiguration scanning (optional, --nuclei).
+            #    Like feroxbuster, starts right after Stage 3 — only needs
+            #    03_tech.json + 03_alive_urls.txt. Parallel to Stages 4-6.
+            if self.settings.run_nuclei:
+                nuclei_thread = threading.Thread(
+                    target=self._run_nuclei, args=(ctx,),
+                    name="nuclei", daemon=True,
+                )
+                nuclei_thread.start()
+                log.info("Stage 8 (nuclei) launched in background — "
+                         "running parallel to Stages 4-6")
+
             # 4. Drop CDN/WAF edges so we scan real origins, not shared CDN infra.
             #    Any IP httpx proved reachable is force-kept scannable (overrides a
             #    cdncheck misclassification; never removes a host).
@@ -68,9 +100,6 @@ class Pipeline:
 
             # 6. nmap aggressive deep scan (authoritative) over the scannable IPs.
             stages.stage_nmap(ctx, scannable_ips, port_map)
-
-            # 7. Directory fuzzing (optional, opt-in via --fuzz).
-            stages.stage_feroxbuster(ctx, resolved, scannable_ips)
         except KeyboardInterrupt:
             status = "interrupted"
             log.warning("Interrupted by user — partial results preserved")
@@ -78,11 +107,31 @@ class Pipeline:
             status = "error"
             log.exception("Pipeline error: %s", exc)
         finally:
+            if ferox_thread and ferox_thread.is_alive():
+                log.info("Waiting for feroxbuster background thread to finish…")
+                ferox_thread.join()
+            if nuclei_thread and nuclei_thread.is_alive():
+                log.info("Waiting for nuclei background thread to finish…")
+                nuclei_thread.join()
             self.storage.finish_run(run_id, _now(), status)
 
         report_path = self._write_report(run_id, status)
         self.storage.close()
         return report_path
+
+    @staticmethod
+    def _run_feroxbuster(ctx: stages.Context) -> None:
+        try:
+            stages.stage_feroxbuster(ctx)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Feroxbuster background thread failed: %s", exc)
+
+    @staticmethod
+    def _run_nuclei(ctx: stages.Context) -> None:
+        try:
+            stages.stage_nuclei(ctx)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Nuclei background thread failed: %s", exc)
 
     # -- reporting --------------------------------------------------------
     def _read_tarpit_data(self) -> Dict[str, Any]:
@@ -114,6 +163,7 @@ class Pipeline:
         active = self.storage.active_subdomains(run_id)      # {sub: [ips]}
         inactive = self.storage.inactive_subdomains(run_id)  # [names]
         fuzz_rows = self.storage.fuzz_results_summary(run_id)
+        nuclei_rows = self.storage.nuclei_findings_summary(run_id)
         tarpit_data = self._read_tarpit_data()
         tarpit_ips = tarpit_data.get("tarpit_ips", [])
 
@@ -126,6 +176,7 @@ class Pipeline:
             "open_ports": [dict(r) for r in ports],
             "tarpit_ips": tarpit_ips,
             "fuzz_results": [dict(r) for r in fuzz_rows],
+            "nuclei_findings": [dict(r) for r in nuclei_rows],
         })
 
         lines = [
@@ -149,6 +200,7 @@ class Pipeline:
             f"| Open ports | {counts['open_ports']} |",
             f"| nmap script findings | {counts['nmap_findings']} |",
             f"| Directory fuzz paths | {counts['fuzz_results']} |",
+            f"| Nuclei CVE findings | {counts['nuclei_findings']} |",
             "",
         ]
         if tarpit_ips:
@@ -221,6 +273,23 @@ class Pipeline:
                 lines.append(
                     f"| {r['target_url']} | {r['found_url']} | "
                     f"{r['status'] or ''} | {r['content_length'] or ''} |"
+                )
+        if nuclei_rows:
+            lines += [
+                "",
+                "## Nuclei CVE findings",
+                "",
+                f"**{len(nuclei_rows)} finding(s)** from tech-targeted CVE + "
+                f"misconfiguration scanning.",
+                "",
+                "| Severity | Template | Host | Matched At | Description |",
+                "|---|---|---|---|---|",
+            ]
+            for r in nuclei_rows:
+                desc = (r["description"] or "")[:80]
+                lines.append(
+                    f"| {r['severity'] or ''} | {r['template_id']} | "
+                    f"{r['host']} | {r['matched_at'] or ''} | {desc} |"
                 )
         report_md = self.workdir / "report.md"
         report_md.write_text("\n".join(lines) + "\n", encoding="utf-8")

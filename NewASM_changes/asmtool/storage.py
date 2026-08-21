@@ -101,13 +101,40 @@ CREATE TABLE IF NOT EXISTS nmap_findings (
     output    TEXT,
     raw_ref   TEXT
 );
+
+CREATE TABLE IF NOT EXISTS fuzz_results (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id         INTEGER NOT NULL,
+    target_url     TEXT NOT NULL,
+    found_url      TEXT NOT NULL,
+    status         INTEGER,
+    content_length INTEGER,
+    UNIQUE(run_id, found_url)
+);
+
+CREATE TABLE IF NOT EXISTS nuclei_findings (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id         INTEGER NOT NULL,
+    host           TEXT NOT NULL,
+    url            TEXT,
+    template_id    TEXT NOT NULL,
+    template_name  TEXT,
+    severity       TEXT,
+    matched_at     TEXT,
+    extracted      TEXT,
+    curl_command   TEXT,
+    description    TEXT,
+    reference      TEXT,
+    tags           TEXT,
+    UNIQUE(run_id, host, template_id, matched_at)
+);
 """
 
 
 class Storage:
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(db_path))
+        self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         self.conn.commit()
@@ -192,6 +219,46 @@ class Storage:
             (run_id, ip, port, script_id, output, raw_ref),
         )
 
+    def port_count(self, run_id: int, ip: str) -> int:
+        """Number of open ports recorded for an IP in this run."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM ports WHERE run_id=? AND ip=?",
+            (run_id, ip),
+        ).fetchone()
+        return int(row[0])
+
+    def purge_ports(self, run_id: int, ip: str) -> int:
+        """Delete all port rows for an IP (used when post-scan tarpit detection
+        identifies fake open ports). Returns the number of rows deleted."""
+        cur = self.conn.execute(
+            "DELETE FROM ports WHERE run_id=? AND ip=?",
+            (run_id, ip),
+        )
+        return cur.rowcount
+
+    def add_fuzz_result(self, run_id: int, target_url: str, found_url: str,
+                        status: Optional[int] = None,
+                        content_length: Optional[int] = None) -> None:
+        self.conn.execute(
+            "INSERT OR IGNORE INTO fuzz_results(run_id,target_url,found_url,"
+            "status,content_length) VALUES (?,?,?,?,?)",
+            (run_id, target_url, found_url, status, content_length),
+        )
+
+    def add_nuclei_finding(self, run_id: int, host: str, url: Optional[str],
+                           template_id: str, template_name: Optional[str],
+                           severity: Optional[str], matched_at: Optional[str],
+                           extracted: Optional[str], curl_command: Optional[str],
+                           description: Optional[str], reference: Optional[str],
+                           tags: Optional[str]) -> None:
+        self.conn.execute(
+            "INSERT OR IGNORE INTO nuclei_findings(run_id,host,url,template_id,"
+            "template_name,severity,matched_at,extracted,curl_command,"
+            "description,reference,tags) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, host, url, template_id, template_name, severity,
+             matched_at, extracted, curl_command, description, reference, tags),
+        )
+
     def commit(self) -> None:
         self.conn.commit()
 
@@ -207,6 +274,8 @@ class Storage:
             "open_ports": q("SELECT COUNT(*) FROM ports WHERE run_id=?"),
             "http_services": q("SELECT COUNT(*) FROM http_probes WHERE run_id=?"),
             "nmap_findings": q("SELECT COUNT(*) FROM nmap_findings WHERE run_id=?"),
+            "fuzz_results": q("SELECT COUNT(*) FROM fuzz_results WHERE run_id=?"),
+            "nuclei_findings": q("SELECT COUNT(*) FROM nuclei_findings WHERE run_id=?"),
         }
 
     def open_ports_summary(self, run_id: int) -> List[sqlite3.Row]:
@@ -236,6 +305,23 @@ class Storage:
             (run_id,),
         ).fetchall()
         return [r["name"] for r in rows]
+
+    def fuzz_results_summary(self, run_id: int) -> List[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT target_url, found_url, status, content_length "
+            "FROM fuzz_results WHERE run_id=? ORDER BY target_url, found_url",
+            (run_id,),
+        ).fetchall()
+
+    def nuclei_findings_summary(self, run_id: int) -> List[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT host, url, template_id, template_name, severity, "
+            "matched_at, description, reference, tags "
+            "FROM nuclei_findings WHERE run_id=? ORDER BY "
+            "CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
+            "WHEN 'medium' THEN 2 ELSE 3 END, host",
+            (run_id,),
+        ).fetchall()
 
     def close(self) -> None:
         self.conn.close()

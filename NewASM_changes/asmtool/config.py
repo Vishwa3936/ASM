@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 # ---------------------------------------------------------------------------
 # External tool binary names.
@@ -77,6 +77,7 @@ TOOL_BINARIES = {
     "masscan": _tool_paths(["masscan"]),
     "nmap": _tool_paths(["nmap"]),
     "feroxbuster": _tool_paths(["feroxbuster"]),
+    "nuclei": _tool_paths(["nuclei"]),
 }
 
 # Per-invocation subprocess timeouts (seconds). Port/host tools are per-target,
@@ -92,6 +93,7 @@ TIMEOUTS = {
     "masscan": 1800,   # whole list (stateless, one invocation)
     "nmap": 1800,      # per IP
     "feroxbuster": 600,  # per URL (5m default time-limit + buffer)
+    "nuclei": 900,       # per host (CVE + misconfig templates are network-heavy)
 }
 
 # ---------------------------------------------------------------------------
@@ -180,6 +182,38 @@ FEROX_FILTER_STATUS: str = "404,429,400,501"
 FEROX_USER_AGENT: str = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                          "AppleWebKit/537.36 (KHTML, like Gecko) "
                          "Chrome/120.0.0.0 Safari/537.36")
+
+# ---------------------------------------------------------------------------
+# Nuclei CVE + misconfiguration scanning (Stage 8, opt-in via --nuclei).
+#
+# Tech-targeted vulnerability detection using httpx fingerprints from Stage 3.
+# Conservative: CVEs + misconfigs only, no DoS/fuzz/intrusive, rate-limited,
+# medium+ severity. Uses httpx tech names mapped to nuclei template tags so
+# each host is scanned only for vulnerabilities relevant to its detected stack.
+# ---------------------------------------------------------------------------
+NUCLEI_TEMPLATE_DIRS: List[str] = ["cves/", "misconfiguration/"]
+NUCLEI_EXCLUDE_TAGS: str = "dos,fuzz,intrusive"
+NUCLEI_SEVERITY: str = "critical,high,medium"
+
+# Map httpx technology names to nuclei template tags. Most map via simple
+# lowercasing; this table handles known mismatches. Keys are lowercased httpx
+# tech names; empty-string values mean "skip this tech" (too generic / no CVEs).
+NUCLEI_TECH_TAG_MAP: Dict[str, str] = {
+    "microsoft iis": "iis",
+    "iis": "iis",
+    "drupal cms": "drupal",
+    "ruby on rails": "rails",
+    "asp.net": "asp",
+    "jquery": "",
+    "bootstrap": "",
+    "font awesome": "",
+    "google font api": "",
+    "google analytics": "",
+    "google tag manager": "",
+    "recaptcha": "",
+    "hsts": "",
+    "open graph": "",
+}
 
 # httpx-toolkit (ProjectDiscovery httpx) flags for Stage 3. Beyond the core
 # status/title/tech-detect, we harvest the connected IP, CNAME, httpx's OWN CDN
@@ -313,6 +347,13 @@ class Settings:
     tarpit_detection: bool = True
     tarpit_threshold: int = 15           # out of 20 probe ports
 
+    # httpx-toolkit concurrency / rate-limiting (Stage 3). Defaults lowered from
+    # httpx's own 50-thread / 150-rps to avoid triggering WAF rate-limits when many
+    # hostnames share the same CDN/WAF IP (e.g. Incapsula). The cost is a few extra
+    # seconds on large host lists — negligible vs. nmap/rustscan runtime.
+    httpx_threads: int = 25
+    httpx_rate_limit: int = 30       # requests/sec
+
     # Feroxbuster directory fuzzing (Stage 7, opt-in via --fuzz).
     run_feroxbuster: bool = False
     ferox_threads: int = 10              # feroxbuster internal threads (per URL)
@@ -320,3 +361,12 @@ class Settings:
     ferox_time_limit: str = "5m"         # wall-clock cap per URL
     ferox_wordlist: str = FEROX_DEFAULT_WORDLIST
     threads_ferox: int = 3               # concurrent URLs being fuzzed
+
+    # Nuclei CVE + misconfiguration scanning (Stage 8, opt-in via --nuclei).
+    run_nuclei: bool = False
+    nuclei_rate_limit: int = 30          # requests/sec per host
+    nuclei_concurrency: int = 10         # nuclei internal concurrency (-c)
+    nuclei_severity: str = NUCLEI_SEVERITY
+    nuclei_timeout: str = "10m"          # per-host wall-clock cap
+    threads_nuclei: int = 3              # concurrent hosts being scanned
+    nuclei_extra_tags: str = ""          # additional tags (comma-separated)
